@@ -38,38 +38,49 @@ and tx references exact.
 | User says (examples) | Run |
 | --- | --- |
 | "check my balance", "how much test USDT do I have", "game status" | `balance` |
-| "bet 10 on even", "put 5 on hi", "wager 20 odd" | `bet even 10` |
+| "bet 10 on even", "put 5 on hi", "wager 20 lower" | `bet even 10` |
 | "bet 10 that the digit is 7", "exact digit 3 for 5" | `bet digit 10 7` |
+| "did my bet win", "what's the result", "check bet <id>" | `result <request_id>` |
 | "top me up", "I'm out of test USDT", "give me more" | `faucet` |
 | "refill the house", "bankroll is low" | `faucet house 2000` |
-| "did my bet win", "check bet <id>", "verify that bet" | `verify <request_id>` |
+| "verify that bet", "prove it was fair" | `verify <request_id>` |
 | "how do I play", "what can I do" | `help` |
+
+Note: "lower"/"low" → `lo`, "higher"/"high" → `hi`.
 
 **Markets:** `even`, `odd`, `hi` (nibble 8–15), `lo` (nibble 0–7) all pay ~1.98×.
 `digit` (guess the exact nibble 0–15) pays ~15.84×. The 1% house edge is shown openly.
 
-## What to expect when a bet is placed
+## What to expect when a bet is placed (IMPORTANT for UX)
 
-`bet` places the wager on-chain, then **waits for Chainlink VRF to settle** (usually
-1–2 minutes on Sepolia). The client polls automatically and prints the final
-win/loss with the rolled nibble. If VRF is slow and it times out, it returns a
-`request_id`; tell the user you'll check again, and run `verify <request_id>` shortly
-after.
+Settlement runs through Chainlink VRF, which takes ~1–2 minutes. So a bet is **two
+steps**, and you should keep the user informed the whole time so it never looks
+frozen:
+
+1. Run `bet …`. It returns **immediately** with a `request_id` and "Settling… ~1–2
+   min." **Show that to the user right away** so they see the bet landed.
+2. Then run `result <request_id>` to fetch the outcome. Each call waits ~15s and
+   returns either the win/loss card or "Still settling." If it's still settling,
+   **post a short update** ("⏳ still waiting on Chainlink…") and call `result` again.
+   Repeat until it settles (usually 1–4 calls). Then show the final card.
+
+Never place a bet and then go silent — always confirm the placement first, then
+narrate the wait via repeated `result` checks.
 
 If a bet is rejected:
-- **"house liquidity too low"** → run `faucet house 2000` to refill the bankroll, then retry.
-- **"out of USDT"** → run `faucet` to top up the test wallet, then retry.
-- **"bet must be 1–100 USDT"** → the amount is outside the configured limits.
+- **"house liquidity too low"** → run `faucet house 2000`, then retry.
+- **"out of USDT"** → run `faucet`, then retry.
+- **"bet must be 1–100 USDT"** → amount is outside the configured limits.
 
 ## Configuration (set once by the installer)
 
-The skill reads two environment variables:
+The skill resolves the sidecar from environment variables first, then a config file:
 
-- `HASHINO_SIDECAR_URL` — the deployed sidecar URL (e.g. `https://superclaw-hashino-sidecar.onrender.com`)
-- `HASHINO_API_KEY` — the shared secret (must match the sidecar's `API_KEY`)
+- `HASHINO_SIDECAR_URL` / `HASHINO_API_KEY` env vars, **or**
+- `~/.superclaw-games/hashino_config.json` → `{"sidecar_url": "...", "api_key": "..."}`
 
-If `HASHINO_SIDECAR_URL` is unset, the client says so — that means the sidecar
-hasn't been wired up yet (see the project README for deploy steps).
+If neither is present, the client says the sidecar isn't configured — that means it
+hasn't been wired up yet (see the project README).
 
 ## Hard line (do not cross)
 

@@ -2,21 +2,26 @@
 """SuperClaw Hashino (TESTNET) — in-app client.
 
 The team plays provably-fair Hashino against the live Sepolia contract WITHOUT a
-terminal, wallet, or faucet. This script holds NO keys and signs nothing — it
-just calls the betting sidecar over HTTPS and renders the result. All bets use
-MOCK USDT on a testnet: no real money is ever involved.
+terminal, wallet, or faucet. This script holds NO keys and signs nothing — it just
+calls the betting sidecar over HTTPS and renders the result. All bets use MOCK USDT
+on a testnet: no real money is ever involved.
+
+Bets settle via Chainlink VRF, which takes ~1-2 min. So a bet is TWO quick steps:
+  1) `bet`     places it and returns immediately (so the app never looks frozen)
+  2) `result`  fetches the outcome; the agent polls this and shows live progress
 
 Commands (the agent maps natural language onto these):
   balance                      show test-wallet + house balances and bet limits
-  bet <market> <amount> [n]    place a bet and wait for the on-chain result
+  bet <market> <amount> [n]    place a bet (returns instantly with a request_id)
                                market = even | odd | hi | lo | digit
                                for digit, n = the exact nibble 0-15
+  result <request_id>          fetch the outcome (poll until settled)
   faucet [player|house] [amt]  top up mock USDT so QA never stalls
-  verify <request_id>          re-check / explain a settled bet (provably fair)
+  verify <request_id>          explain a settled bet (provably fair)
   help
 
-Config (env): HASHINO_SIDECAR_URL  (e.g. https://superclaw-hashino-sidecar.onrender.com)
-              HASHINO_API_KEY      (same secret set on the sidecar)
+Config: env HASHINO_SIDECAR_URL / HASHINO_API_KEY, else
+        ~/.superclaw-games/hashino_config.json  {"sidecar_url":..., "api_key":...}
 """
 import os
 import sys
@@ -24,25 +29,29 @@ import time
 
 import requests
 
+
 def _load_cfg():
-    import json, pathlib
+    import json
+    import pathlib
     p = pathlib.Path.home() / ".superclaw-games" / "hashino_config.json"
     try:
         return json.loads(p.read_text())
     except Exception:
         return {}
+
+
 _CFG = _load_cfg()
 BASE = (os.environ.get("HASHINO_SIDECAR_URL") or _CFG.get("sidecar_url", "")).rstrip("/")
 API_KEY = os.environ.get("HASHINO_API_KEY") or _CFG.get("api_key", "")
 HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
 TIMEOUT = 30
-POLL_TRIES = int(os.environ.get("HASHINO_POLL_TRIES", "30"))
-POLL_EVERY = float(os.environ.get("HASHINO_POLL_EVERY", "5"))   # ~150s total wait for VRF
+RESULT_TRIES = int(os.environ.get("HASHINO_RESULT_TRIES", "3"))   # per `result` call
+RESULT_EVERY = float(os.environ.get("HASHINO_RESULT_EVERY", "5"))  # ~15s per call
 
 MARKETS = {"even", "odd", "hi", "lo", "digit"}
 WIN_RULE = {
     "even": "nibble is even (0,2,4…)", "odd": "nibble is odd (1,3,5…)",
-    "hi": "nibble is 8–15", "lo": "nibble is 0–7", "digit": "nibble exactly matches",
+    "hi": "nibble is 8–15", "lo": "nibble is 0–7", "digit": "nibble matches exactly",
 }
 BANNER = "🧪 **TESTNET** · mock USDT · no real money"
 
@@ -62,7 +71,8 @@ def _post(path, body):
 
 def _need_config():
     if not BASE:
-        _die("HASHINO_SIDECAR_URL is not set. Point it at the deployed sidecar URL.")
+        _die("Sidecar not configured. Set HASHINO_SIDECAR_URL + HASHINO_API_KEY, "
+             "or write ~/.superclaw-games/hashino_config.json.")
 
 
 def cmd_balance():
@@ -76,7 +86,7 @@ def cmd_balance():
     print(f"- Bet limits: {d['min_bet']:.0f}–{d['max_bet']:.0f} USDT  ·  house edge {d['edge_pct']:.1f}%")
     print(f"- Contract: `{d['hashino']}` (Sepolia)")
     if d["player_eth"] < 0.005:
-        print("\n> ⛽ Test wallet is low on Sepolia ETH for gas — top it up from a faucet.")
+        print("\n> ⛽ Test wallet low on Sepolia ETH for gas — top it up from a faucet.")
 
 
 def cmd_bet(args):
@@ -96,8 +106,7 @@ def cmd_bet(args):
         except (IndexError, ValueError):
             _die("digit bets need a target nibble 0-15, e.g. `bet digit 5 7`")
 
-    body = {"market": market, "amount": amount, "choice": choice}
-    res = _post("/bet", body)
+    res = _post("/bet", {"market": market, "amount": amount, "choice": choice})
     if not res.get("ok"):
         _die(f"bet rejected: {res.get('error', 'unknown error')}")
 
@@ -107,29 +116,41 @@ def cmd_bet(args):
     print(f"### 🎲 Bet placed — {amount:.0f} USDT on **{pick}**")
     print(f"- Potential payout: **{res['potential_payout']:.2f} USDT**")
     print(f"- Win if: {WIN_RULE[market]}")
-    print(f"- VRF request: `{rid[:10]}…`  ·  tx `{res['tx_hash'][:12]}…`")
-    print("\n_Waiting for Chainlink VRF to settle on-chain…_")
-
-    for _ in range(POLL_TRIES):
-        time.sleep(POLL_EVERY)
-        r = _get(f"/result/{rid}")
-        if r.get("settled"):
-            return _render_result(r, amount, pick)
-    print(f"\n> ⏳ Still settling (VRF can take a couple minutes). "
-          f"Check again with: `verify {rid}`")
+    print(f"- VRF request `{rid[:12]}…`  ·  tx `{res['tx_hash'][:12]}…`")
+    print("\n⏳ Settling on-chain via Chainlink VRF — usually 1–2 min.")
+    print(f"NEXT: fetch the outcome with `result {rid}`")
 
 
-def _render_result(r, amount, pick):
+def _render_result(r):
     won, nib, payout = r["won"], r["nibble"], r["payout"]
-    print()
+    amount = r.get("amount", 0.0)
+    market = r.get("market", "")
+    pick = f"digit {r.get('choice')}" if market == "digit" else market
+    print(f"{BANNER}\n")
     if won:
         print(f"### ✅ WON — rolled nibble **{nib}**")
-        print(f"- Bet **{pick}** → paid out **{payout:.2f} USDT** (net +{payout - amount:.2f})")
+        print(f"- Bet **{pick}** ({amount:.0f} USDT) → paid out **{payout:.2f} USDT** (net +{payout - amount:.2f})")
     else:
         print(f"### ❌ Lost — rolled nibble **{nib}**")
-        print(f"- Bet **{pick}** → stake of {amount:.0f} USDT goes to the house")
+        print(f"- Bet **{pick}** → {amount:.0f} USDT stake goes to the house")
     print(f"- Settled on-chain · tx `{r['tx_hash'][:12]}…`")
-    print(f"\n{BANNER} · result came from live Chainlink VRF — nobody could predict it.")
+    print(f"\n{BANNER} · outcome from live Chainlink VRF — nobody could predict it.")
+
+
+def cmd_result(args):
+    if not args:
+        _die("usage: result <request_id>")
+    rid = args[0]
+    for _ in range(RESULT_TRIES):
+        r = _get(f"/result/{rid}")
+        if "error" in r:
+            _die(r["error"])
+        if r.get("settled"):
+            return _render_result(r)
+        time.sleep(RESULT_EVERY)
+    print(f"{BANNER}\n")
+    print(f"⏳ Still settling — Chainlink VRF hasn't returned yet. "
+          f"Check again with `result {rid}` in a few seconds.")
 
 
 def cmd_faucet(args):
@@ -166,15 +187,16 @@ def cmd_verify(args):
     print(f"- Rolled nibble: **{r['nibble']}** (= VRF random word mod 16)")
     print(f"- Outcome: **{'WON' if r['won'] else 'LOST'}**  ·  payout field {r['payout']:.2f} USDT")
     print(f"- Settlement tx: `{r['tx_hash']}`")
-    print("\nThe nibble is derived from a Chainlink VRF random number that only the "
-          "VRF coordinator can produce — provably fair and impossible to predict.")
+    print("\nThe nibble comes from a Chainlink VRF random number only the VRF "
+          "coordinator can produce — provably fair and impossible to predict.")
 
 
 def cmd_help():
     print(f"{BANNER}\n")
     print("### 🎰 Hashino testnet — commands")
     print("- `balance` — wallet, house bankroll, limits")
-    print("- `bet even 10` / `bet hi 5` / `bet digit 10 7` — place a bet, get the result")
+    print("- `bet even 10` / `bet lo 5` / `bet digit 10 7` — place a bet (returns instantly)")
+    print("- `result <request_id>` — fetch the outcome once VRF settles")
     print("- `faucet` — top up mock USDT  (`faucet house 2000` to refill the bankroll)")
     print("- `verify <request_id>` — re-check a settled bet")
 
@@ -189,6 +211,8 @@ def main():
             cmd_balance()
         elif cmd == "bet":
             cmd_bet(rest)
+        elif cmd == "result":
+            cmd_result(rest)
         elif cmd == "faucet":
             cmd_faucet(rest)
         elif cmd == "verify":
