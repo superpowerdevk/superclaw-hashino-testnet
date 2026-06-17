@@ -41,8 +41,13 @@ def _load_cfg():
 
 
 _CFG = _load_cfg()
-BASE = (os.environ.get("HASHINO_SIDECAR_URL") or _CFG.get("sidecar_url", "")).rstrip("/")
-API_KEY = os.environ.get("HASHINO_API_KEY") or _CFG.get("api_key", "")
+# Shipped defaults so the skill works the moment it's installed — no per-user setup.
+# TESTNET ONLY: this gates a mock-USDT sidecar, so a shared key here is low-risk.
+# Precedence: env vars > ~/.superclaw-games/hashino_config.json > these defaults.
+DEFAULT_SIDECAR_URL = "https://superclaw-hashino-sidecar.onrender.com"
+DEFAULT_API_KEY = "claw-test-123"
+BASE = (os.environ.get("HASHINO_SIDECAR_URL") or _CFG.get("sidecar_url") or DEFAULT_SIDECAR_URL).rstrip("/")
+API_KEY = os.environ.get("HASHINO_API_KEY") or _CFG.get("api_key") or DEFAULT_API_KEY
 HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
 TIMEOUT = 30
 RESULT_TRIES = int(os.environ.get("HASHINO_RESULT_TRIES", "3"))   # per `result` call
